@@ -1,0 +1,177 @@
+#!/usr/bin/python
+
+# ref:
+# http://www.pod2g.org/2012/02/working-gnu-debugger-on-ios-43.html
+# http://maliciousattacker.blogspot.tw/2011/02/finding-heap-of-iphone-application.html
+# http://code.google.com/p/pygdb/
+
+import re
+import struct
+import subprocess
+import sys
+import time
+
+GDB_PROMPT = '(gdb) \n'
+GDB_CMDLINE = 'gdb -n -q -i mi'
+
+class GDB(object):
+    def __init__(self):
+        self.proc = subprocess.Popen(GDB_CMDLINE, 0, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.read()
+
+    def attach(self, pid_or_name=None):
+        if not pid_or_name:
+            pids = []
+            n = 0
+            for line in subprocess.Popen('ps aux', shell=1, stdout=subprocess.PIPE).stdout:
+                if '/var/mobile/Applications/' in line:
+                    pids.append(int(line.split()[1]))
+                    n += 1
+                    print '%2d %s' % (n, line.split(None, 10)[-1])
+            assert n
+            r = raw_input('enter 1-%d: ' % n)
+            try:
+                pid_or_name = pids[int(r) - 1]
+            except:
+                sys.exit(0)
+
+        if isinstance(pid_or_name, int):
+            pid = pid_or_name
+        else:
+            pid = int(re.search('.*Application.*' + pid_or_name, subprocess.Popen('ps aux', shell=1, stdout=subprocess.PIPE).stdout.read()).group(0).split()[1])
+
+        print 'attaching to process %d, wait for 10~30 seconds' % pid
+        self.send('attach %d' % pid)
+        self.read()
+        print 'attached'
+
+    def read(self):
+        lines = []
+        while(True):
+            line = self.proc.stdout.readline()
+            if not line or line == GDB_PROMPT:
+                return lines
+            lines.append(line)
+
+    def send(self, cmd):
+        self.proc.stdin.write(cmd + '\n')
+
+    def wait(self, s):
+        while 1:
+            res = self.read()
+            for line in res:
+                if s in line:
+                    return res
+            time.sleep(0.1)
+            self.send('')
+
+    def find_heap(self):
+        tries = 1000
+        black_list = set()
+        while 1:
+            print 'find heap region'
+
+            self.send('break malloc')
+            self.read()
+
+            self.send('continue')
+            self.wait('^done,reason=')
+
+            self.send('finish')
+            self.wait('^done,reason=')
+
+            self.send('info mach-region $r0')
+            res = self.read()
+            m = re.search('Region from (\w+) to (\w+)', res[1])
+            start = eval(m.group(1))
+            end = eval(m.group(2))
+
+            if start < 0x100000:
+                continue
+            print 'heap region found 0x%x - 0x%x' % (start, end)
+
+            skip = any(i[0] <= start <= end <= i[1] for i in black_list)
+            if (skip or raw_input('(y/n) ') != 'y') and tries:
+                tries -= 1
+                black_list.add((start, end))
+                print 'tries', tries, 'black_list', black_list
+                continue
+
+            self.send('delete breakpoints')
+            self.read()
+
+            return (start, end)
+
+    def dump(self, filename, start, end):
+        self.send('dump memory %s %d %d' % (filename, start, end))
+        self.read()
+
+def getpid(name):
+    return int(re.search('.*' + name, subprocess.Popen('ps aux', shell=1, stdout=subprocess.PIPE).stdout.read()).group(0).split()[1])
+
+def main():
+    pname = (sys.argv[1:] or [''])[0]
+    #if sys.argv[1:]:
+    #    pname = sys.argv[1]
+    #else:
+    #    print 'usage: cheat pid_or_proc_name'
+    #    return 0
+
+    st = struct.Struct('i')
+
+    gdb = GDB()
+    gdb.attach(pname)
+    while 1:
+        'start new search'
+        start, end = gdb.find_heap()
+        search_list = xrange(start, end, 4)
+        while 1:
+            gdb.send('continue')
+            gdb.read()
+            input_val = raw_input('input integer, n=new search, q=quit, r=set region(start, end): ')
+            gdb.send('-exec-interrupt')
+            gdb.send('')
+            gdb.read()
+            if input_val == 'n':
+                break
+            elif input_val == 'q':
+                gdb.send('q')
+                return 0
+            elif re.match('\d+', input_val):
+                value = int(input_val)
+            elif input_val.startswith('r'):
+                try:
+                    start, end = [eval(i) for i in input_val.split()[1:]]
+                    search_list = xrange(start, end, 4)
+                    print 'set search range to %x %x' % (start, end)
+                except:
+                    print 'r start, end'
+                continue
+            else:
+                gdb.send(input_val)
+                for line in gdb.read():
+                    print line,
+                print
+                continue
+
+            gdb.dump('dump.bin', start, end)
+
+            mem = open('dump.bin', 'rb').read()
+
+            print 'scanning for %d' % value
+            new_list = []
+            for addr in search_list:
+                i = addr - start
+                if st.unpack(mem[i:i+4])[0] == value:
+                    new_list.append(addr)
+                    print 'find 0x%x' % addr
+            search_list = new_list
+            print 'found %d results' % len(search_list)
+            if len(search_list) == 1:
+                value = input('enter a value to set: ')
+                gdb.send('set {int}%d = %d' % (search_list[0], value))
+                gdb.read()
+
+if __name__ == '__main__':
+    sys.exit(main())
+
